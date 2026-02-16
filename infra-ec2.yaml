@@ -1,0 +1,194 @@
+# CloudFormation: Infrastructure stack – EC2, IAM, Secrets Manager, Security Group, instance tagging
+# Deploy first. Outputs (e.g. InstanceId, SecurityGroupId, SecretArn) can be used by cicd stack.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "DevOps Demo - EC2, IAM, Secrets Manager, Security Group, CodeDeploy-ready instance"
+
+Parameters:
+  KeyName:
+    Type: String
+    Description: EC2 Key Pair name for SSH (optional; leave blank to use Session Manager only)
+    Default: ""
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t2.small, t3.micro, t3.small]
+  SecretValue:
+    Type: String
+    NoEcho: true
+    Description: Value to store in Secrets Manager (e.g. app password)
+    Default: "ChangeMeInProduction123"
+  EnvironmentName:
+    Type: String
+    Default: devops-demo
+
+Conditions:
+  UseKeyName: !Not [!Equals [!Ref KeyName, ""]]
+
+Resources:
+  # ---- AWS Secrets Manager (part of infra stack) ----
+  # Secret consumed by the app at runtime; value is masked in the UI
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${EnvironmentName}/app-secret"
+      Description: Secret for DevOps demo app (masked in UI)
+      SecretString: !Sub '{"password":"${SecretValue}"}'
+
+  # ---- IAM role for EC2 (Secrets Manager + CodeDeploy + Session Manager) ----
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-ec2-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  # CodeDeploy + CodePipeline: EC2 must read deployment artifacts from S3 (inline policy; avoids deprecated managed policy)
+  EC2CodeDeployS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeDeployS3Access
+      Roles:
+        - !Ref EC2Role
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::aws-codedeploy-${AWS::Region}"
+              - !Sub "arn:${AWS::Partition}:s3:::aws-codedeploy-${AWS::Region}/*"
+              - !Sub "arn:${AWS::Partition}:s3:::devops-demo-pipeline-artifacts-${AWS::AccountId}"
+              - !Sub "arn:${AWS::Partition}:s3:::devops-demo-pipeline-artifacts-${AWS::AccountId}/*"
+
+  # Allow EC2 to read the app secret
+  EC2SecretsManagerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ReadAppSecret
+      Roles:
+        - !Ref EC2Role
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref AppSecret
+
+  # Instance profile so EC2 can assume the role
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${EnvironmentName}-ec2-profile"
+      Roles:
+        - !Ref EC2Role
+
+  # Security group: SSH (22), App (8000)
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${EnvironmentName}-sg"
+      GroupDescription: Allow SSH and app port 8000
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+          Description: Flask app
+
+  # EC2 instance with UserData: install CodeDeploy agent, create app dir and venv
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default: [codedeploy, appdir]
+        codedeploy:
+          packages:
+            yum:
+              ruby: []
+              wget: []
+          commands:
+            "01_install_agent":
+              command: |
+                export REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+                cd /tmp
+                wget "https://aws-codedeploy-${REGION}.s3.${REGION}.amazonaws.com/latest/install" -O install
+                chmod +x install
+                ./install auto
+                # Ensure agent service is enabled and started
+                systemctl enable codedeploy-agent || service codedeploy-agent start || true
+                systemctl start codedeploy-agent || service codedeploy-agent start || true
+                # Wait a moment for agent to initialize
+                sleep 5
+              ignoreErrors: false
+        appdir:
+          commands:
+            "01_create_app_dir":
+              command: |
+                mkdir -p /var/www/devops-demo
+                python3 -m venv /var/www/devops-demo/.venv
+                chown -R root:root /var/www/devops-demo
+          files:
+            "/etc/devops-demo/secret-name":
+              content: !Ref AppSecret
+              mode: "000644"
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      KeyName: !If [UseKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+        - Key: CodeDeploy
+          Value: devops-demo
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource AppInstance --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource AppInstance --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID for the app
+    Value: !Ref AppInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceId"
+  SecurityGroupId:
+    Description: Security group ID
+    Value: !Ref AppSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+  SecretArn:
+    Description: ARN of the app secret in Secrets Manager
+    Value: !Ref AppSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretArn"
+  SecretName:
+    Description: Secret name (use for APP_SECRET_NAME on EC2)
+    Value: !Ref AppSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretName"

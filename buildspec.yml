@@ -1,0 +1,27 @@
+# AWS CodeBuild buildspec for CI/CD pipeline
+# Produces a zip artifact for AWS CodeDeploy (EC2 in-place)
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Installing build dependencies...
+      - pip install -r requirements.txt
+  build:
+    commands:
+      - echo Running basic validation...
+      - python -c "import flask; import boto3; print('Flask and boto3 OK')"
+  post_build:
+    commands:
+      - echo Creating CodeDeploy revision package...
+      - zip -r deploy.zip app.py requirements.txt appspec.yml templates/ scripts/ -x "*.git*"
+      - echo Build completed on $(date)
+
+artifacts:
+  files:
+    - deploy.zip
+  discard-paths: yes
+
+cache:
+  paths:
+    - '/root/.cache/pip/**/*'
